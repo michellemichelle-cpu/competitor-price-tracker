@@ -30,6 +30,17 @@ COLUMNS = [
     "Voucher Basket Total", "Price/qty after Voucher",
     "Notes",
 ]
+# Category dropdown options (edit this list to add/remove categories)
+CATEGORIES = [
+    "1 Pcs Chicken Rice Set",
+    "1 Pcs Chicken Rice Set (Penyet)",
+    "1 Pcs Chicken Rice Set (Geprek)",
+    "1 Pcs Chicken Complete Set",
+    "2 Pcs Chicken Rice Set",
+    "2 Pcs Chicken Complete Set",
+    "5 Pcs Wings Ala Carte",
+]
+
 # Store names that belong to Hangry (case-insensitive "contains" match)
 HANGRY_BRANDS = [
     "Moon Chicken", "Hot Side Story", "Uno Chicken", "Mak Dura", "Ayam Koplo",
@@ -206,7 +217,11 @@ with st.sidebar:
     week = st.date_input("Week", today - timedelta(days=today.weekday()))
     platform = st.selectbox("Platform", ["GrabFood", "GoFood", "ShopeeFood"])
     db = load_db()
-    categories = sorted(db["Category"].dropna().unique().tolist()) or ["1 Pcs Chicken Rice Set"]
+    # dropdown list + any older categories already saved in the database
+    categories = CATEGORIES + [c for c in db["Category"].dropna().unique() if c not in CATEGORIES]
+    batch_category = st.selectbox(
+        "Category for this batch", categories,
+        help="Applied to new screenshots. You can still change each row in the table.")
 
 tab_in, tab_db, tab_sum = st.tabs(["📤 Upload", "📋 Database", "📊 Summary"])
 
@@ -229,7 +244,7 @@ with tab_in:
             rows.append({
                 "Week": pd.Timestamp(week), "Platform": platform,
                 "Ownership": ownership(x.get("store_name"), x.get("brand")),
-                "Category": categories[0], "Brand": x.get("brand", ""),
+                "Category": batch_category, "Brand": x.get("brand", ""),
                 "Menu Name": x.get("menu_name", ""),
                 "Menu Net Price": net_price(x),
                 "Qty for Voucher": max(1, int(num(x.get("quantity_in_cart")) or 1)),
@@ -254,7 +269,7 @@ with tab_in:
             column_config={
                 "Week": st.column_config.DateColumn(format="D/M/YYYY"),
                 "Ownership": st.column_config.SelectboxColumn(options=["Hangry", "Competitor"]),
-                "Category": st.column_config.SelectboxColumn(options=categories + ["(new — type in Notes)"]),
+                "Category": st.column_config.SelectboxColumn("Category", options=categories, required=True),
                 "_source": st.column_config.TextColumn("Screenshot", disabled=True),
             },
         )
