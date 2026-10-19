@@ -1,0 +1,6 @@
+streamlit>=1.35
+google-genai
+pydantic
+pandas
+openpyxl
+jinja2
