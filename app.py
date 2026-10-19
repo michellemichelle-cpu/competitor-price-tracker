@@ -17,7 +17,7 @@ import pandas as pd
 import streamlit as st
 from google import genai
 from google.genai import types
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 DB_PATH = "competitor_prices.csv"
 # Tried in order; if one is overloaded (503) or rate-limited (429), the next is used.
@@ -27,40 +27,44 @@ COLUMNS = [
     "Week", "Platform", "Ownership", "Category", "Brand", "Menu Name",
     "Menu Net Price", "Cart Voucher %", "Cart Voucher Min Purchase",
     "Cart Voucher Max Disc", "Qty for Voucher", "Platform Fee", "Packaging Fee",
-    "Restaurant Service Charge", "Voucher Basket Total", "Price/qty after Voucher",
+    "Voucher Basket Total", "Price/qty after Voucher",
     "Notes",
 ]
-FORMULA_COLS = ["Qty for Voucher", "Restaurant Service Charge",
-                "Voucher Basket Total", "Price/qty after Voucher"]
+FORMULA_COLS = ["Qty for Voucher", "Voucher Basket Total", "Price/qty after Voucher"]
 
 # ----------------------------------------------------------------------------
 # 1. Extraction with Gemini (vision + JSON schema = reliable structured output)
 # ----------------------------------------------------------------------------
 class Checkout(BaseModel):
-    brand: str                       # Restaurant / brand name, e.g. 'KFC'
-    store_name: str                  # Full outlet name as shown
-    menu_name: str                   # Menu item name exactly as shown
-    menu_unit_price: float           # Price of ONE unit in IDR, before voucher
+    brand: str = Field(description="Restaurant / brand name, e.g. 'KFC'")
+    store_name: str = Field(description="Full outlet name as shown")
+    menu_name: str = Field(description="Menu item name exactly as shown")
+    menu_unit_price: float = Field(description="Price of ONE unit in IDR, before voucher")
     quantity_in_cart: int
     subtotal: float
     voucher_name: str
-    voucher_percent: float           # e.g. 60 for 60%; 0 if none/unknown
-    voucher_min_purchase: float      # Min. belanja; 0 if unknown
-    voucher_max_discount: float      # Maks. diskon / s.d.; 0 if unknown
-    voucher_discount_applied: float  # Discount actually deducted
-    platform_fee: float              # Biaya Platform
-    packaging_fee: float             # Biaya Kemasan
-    restaurant_service_charge: float # Biaya Layanan Restoran
-    delivery_fee: float              # Ongkos Kirim
+    voucher_percent: float = Field(description="e.g. 60 for 60%; 0 if none/unknown")
+    voucher_min_purchase: float = Field(description="Min. order / Min. belanja; 0 if unknown")
+    voucher_max_discount: float = Field(description="Max discount / Maks. diskon / s.d.; 0 if unknown")
+    voucher_discount_applied: float = Field(description="Discount actually deducted")
+    platform_fee: float = Field(description="'Platform fee' / 'Biaya platform'")
+    packaging_fee: float = Field(description="'Restaurant & partner fees' / 'Biaya restoran & mitra' / packaging fee / 'Biaya kemasan'")
+    delivery_fee: float = Field(description="'Delivery fee' / 'Ongkos kirim'")
     total_shown: float
-    uncertain_fields: str            # Fields unreadable or guessed; "" if none
+    uncertain_fields: str = Field(description="Fields unreadable or guessed; empty if none")
 
 
 PROMPT = """These are screenshot(s) from the GrabFood Indonesia app for ONE menu item
 (checkout page, and possibly the voucher/promo detail page). Extract the values.
 - All money is IDR; return plain numbers (e.g. 'Rp34.000' -> 34000).
-- Indonesian labels: Subtotal, Biaya Platform, Biaya Kemasan, Biaya Layanan Restoran,
-  Ongkos Kirim, Diskon/Promo/Voucher, Min. belanja, Maks./s.d. (max discount).
+- The app may be in English or Indonesian. Label mapping:
+  * platform_fee  <- "Platform fee" / "Biaya platform"
+  * packaging_fee <- "Restaurant & partner fees" / "Biaya restoran & mitra" /
+                     "Packaging fee" / "Biaya kemasan"
+  * delivery_fee  <- "Delivery fee" / "Ongkos kirim"
+  * voucher       <- Promo / Discount / Diskon / Voucher; "Min. order"/"Min. belanja",
+                     "Max"/"Maks."/"s.d." = max discount
+- If a fee line has an info icon or a breakdown, use the total shown on that line.
 - If the cart has quantity > 1, menu_unit_price is the price of ONE unit.
 - voucher_percent: e.g. 60 for 60%.
 - Use 0 (or "") for any field that is not visible. Never invent numbers;
@@ -105,7 +109,7 @@ def num(x):
         return 0.0
 
 
-def apply_formulas(df: pd.DataFrame, service_rate: float) -> pd.DataFrame:
+def apply_formulas(df: pd.DataFrame) -> pd.DataFrame:
     df = df.copy()
     for i, r in df.iterrows():
         price = num(r["Menu Net Price"])
@@ -120,10 +124,8 @@ def apply_formulas(df: pd.DataFrame, service_rate: float) -> pd.DataFrame:
         disc = subtotal * pct / 100
         if max_disc:
             disc = min(disc, max_disc)
-        service = round(subtotal * service_rate)
-        basket = subtotal - disc + num(r["Platform Fee"]) + num(r["Packaging Fee"]) + service
+        basket = subtotal - disc + num(r["Platform Fee"]) + num(r["Packaging Fee"])
         df.at[i, "Qty for Voucher"] = qty
-        df.at[i, "Restaurant Service Charge"] = service
         df.at[i, "Voucher Basket Total"] = round(basket)
         df.at[i, "Price/qty after Voucher"] = round(basket / qty)
     return df
@@ -179,7 +181,6 @@ with st.sidebar:
     today = date.today()
     week = st.date_input("Week", today - timedelta(days=today.weekday()))
     platform = st.selectbox("Platform", ["GrabFood", "GoFood", "ShopeeFood"])
-    service_rate = st.number_input("Restaurant service charge %", value=5.0, step=0.5) / 100
     db = load_db()
     categories = sorted(db["Category"].dropna().unique().tolist()) or ["1 Pcs Chicken Rice Set"]
 
@@ -212,7 +213,6 @@ with tab_in:
                 "Platform Fee": x.get("platform_fee", 0),
                 "Packaging Fee": x.get("packaging_fee", 0),
                 "Notes": f"⚠ check: {note}" if note else "",
-                "_svc_on_screen": x.get("restaurant_service_charge", 0),
                 "_source": ", ".join(f.name for f in group),
             })
             prog.progress((n + 1) / len(groups))
@@ -223,7 +223,7 @@ with tab_in:
         st.caption("Yellow-flag anything in Notes. Formula columns recalculate below.")
         draft = st.session_state["draft"]
         edited = st.data_editor(
-            draft.drop(columns=["_svc_on_screen"]),
+            draft,
             num_rows="dynamic", use_container_width=True, key="editor",
             column_config={
                 "Week": st.column_config.DateColumn(format="D/M/YYYY"),
@@ -232,9 +232,7 @@ with tab_in:
                 "_source": st.column_config.TextColumn("Screenshot", disabled=True),
             },
         )
-        result = apply_formulas(edited.reindex(columns=COLUMNS + ["_source"]), service_rate)
-        result["Service charge on screen"] = draft["_svc_on_screen"].values[: len(result)] \
-            if len(result) == len(draft) else None
+        result = apply_formulas(edited.reindex(columns=COLUMNS + ["_source"]))
         st.subheader("Result")
         st.dataframe(result, use_container_width=True)
 
@@ -249,7 +247,7 @@ with tab_db:
     db = load_db()
     edited_db = st.data_editor(db, num_rows="dynamic", use_container_width=True, key="dbedit")
     if st.button("Save changes & recalculate"):
-        save_db(apply_formulas(edited_db, service_rate))
+        save_db(apply_formulas(edited_db))
         st.rerun()
 
 with tab_sum:
