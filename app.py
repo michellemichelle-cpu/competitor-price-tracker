@@ -30,6 +30,19 @@ COLUMNS = [
     "Voucher Basket Total", "Price/qty after Voucher",
     "Notes",
 ]
+# Store names that belong to Hangry (case-insensitive "contains" match)
+HANGRY_BRANDS = [
+    "Moon Chicken", "Hot Side Story", "Uno Chicken", "Mak Dura", "Ayam Koplo",
+    "Bu Tumbar", "Bawang Putri", "TerSereh", "Soto Jeniper", "Barendang",
+    "Bishi Bento", "San Gyu", "Salted Lab",
+]
+
+
+def ownership(*names) -> str:
+    text = " ".join(str(n or "") for n in names).lower()
+    return "Hangry" if any(b.lower() in text for b in HANGRY_BRANDS) else "Competitor"
+
+
 FORMULA_COLS = ["Qty for Voucher", "Voucher Basket Total", "Price/qty after Voucher"]
 
 # ----------------------------------------------------------------------------
@@ -211,7 +224,8 @@ with tab_in:
                 continue
             note = x.get("uncertain_fields") or ""
             rows.append({
-                "Week": pd.Timestamp(week), "Platform": platform, "Ownership": "Competitor",
+                "Week": pd.Timestamp(week), "Platform": platform,
+                "Ownership": ownership(x.get("store_name"), x.get("brand")),
                 "Category": categories[0], "Brand": x.get("brand", ""),
                 "Menu Name": x.get("menu_name", ""),
                 "Menu Net Price": net_price(x),
@@ -235,7 +249,7 @@ with tab_in:
             num_rows="dynamic", use_container_width=True, key="editor",
             column_config={
                 "Week": st.column_config.DateColumn(format="D/M/YYYY"),
-                "Ownership": st.column_config.SelectboxColumn(options=["Us", "Competitor"]),
+                "Ownership": st.column_config.SelectboxColumn(options=["Hangry", "Competitor"]),
                 "Category": st.column_config.SelectboxColumn(options=categories + ["(new — type in Notes)"]),
                 "_source": st.column_config.TextColumn("Screenshot", disabled=True),
             },
