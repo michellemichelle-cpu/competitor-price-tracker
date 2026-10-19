@@ -40,8 +40,8 @@ class Checkout(BaseModel):
     store_name: str = Field(description="Full outlet name as shown")
     menu_name: str = Field(description="Menu item name exactly as shown")
     menu_unit_price: float = Field(description="Price of ONE unit in IDR, before voucher")
-    quantity_in_cart: int
-    subtotal: float
+    quantity_in_cart: int = Field(description="Quantity of the menu item in the cart")
+    subtotal: float = Field(description="'Subtotal (Incl. Tax)' / 'Subtotal (termasuk pajak)' amount")
     voucher_name: str
     voucher_percent: float = Field(description="e.g. 60 for 60%; 0 if none/unknown")
     voucher_min_purchase: float = Field(description="Min. order / Min. belanja; 0 if unknown")
@@ -65,10 +65,18 @@ PROMPT = """These are screenshot(s) from the GrabFood Indonesia app for ONE menu
   * voucher       <- Promo / Discount / Diskon / Voucher; "Min. order"/"Min. belanja",
                      "Max"/"Maks."/"s.d." = max discount
 - If a fee line has an info icon or a breakdown, use the total shown on that line.
+- subtotal <- the "Subtotal (Incl. Tax)" / "Subtotal (termasuk pajak)" line. This is the key value.
 - If the cart has quantity > 1, menu_unit_price is the price of ONE unit.
 - voucher_percent: e.g. 60 for 60%.
 - Use 0 (or "") for any field that is not visible. Never invent numbers;
   list anything unclear in uncertain_fields."""
+
+
+def net_price(x: dict) -> float:
+    """Menu Net Price = Subtotal (Incl. Tax) per unit; falls back to the item price."""
+    sub = num(x.get("subtotal"))
+    qty = max(1, int(num(x.get("quantity_in_cart")) or 1))
+    return round(sub / qty) if sub > 0 else num(x.get("menu_unit_price"))
 
 
 @st.cache_data(show_spinner=False)
@@ -206,7 +214,7 @@ with tab_in:
                 "Week": pd.Timestamp(week), "Platform": platform, "Ownership": "Competitor",
                 "Category": categories[0], "Brand": x.get("brand", ""),
                 "Menu Name": x.get("menu_name", ""),
-                "Menu Net Price": x.get("menu_unit_price", 0),
+                "Menu Net Price": net_price(x),
                 "Cart Voucher %": x.get("voucher_percent", 0),
                 "Cart Voucher Min Purchase": x.get("voucher_min_purchase", 0),
                 "Cart Voucher Max Disc": x.get("voucher_max_discount", 0),
