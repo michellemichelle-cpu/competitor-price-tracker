@@ -4,3 +4,4 @@ pydantic
 pandas
 openpyxl
 jinja2
+requests
