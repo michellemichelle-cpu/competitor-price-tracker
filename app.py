@@ -169,14 +169,82 @@ def apply_formulas(df: pd.DataFrame) -> pd.DataFrame:
 # ----------------------------------------------------------------------------
 # 3. Storage
 # ----------------------------------------------------------------------------
+# Data is stored in a Google Sheet through a small Apps Script web app (no Cloud console).
+# Secrets needed:
+#   SHEET_WEBAPP_URL = "https://script.google.com/macros/s/.../exec"
+#   SHEET_TOKEN      = "same secret word as TOKEN in the Apps Script"
+# Without them the app falls back to a local CSV, which Streamlit Cloud WIPES on restart.
+NUM_COLS = ["Menu Net Price", "Cart Voucher %", "Cart Voucher Min Purchase",
+            "Cart Voucher Max Disc", "Qty for Voucher", "Platform Fee", "Packaging Fee",
+            "Voucher Basket Total", "Price/qty after Voucher"]
+
+
+def use_sheets() -> bool:
+    try:
+        return "SHEET_WEBAPP_URL" in st.secrets and "SHEET_TOKEN" in st.secrets
+    except Exception:
+        return False
+
+
+def sheet_call(action: str, rows=None):
+    import requests
+    url, token = st.secrets["SHEET_WEBAPP_URL"], st.secrets["SHEET_TOKEN"]
+    if action == "read":
+        r = requests.get(url, params={"token": token}, timeout=60)
+    else:
+        r = requests.post(url, data=json.dumps({"token": token, "action": action, "rows": rows,
+                                          "header": COLUMNS}),
+                          headers={"Content-Type": "text/plain"}, timeout=60)
+    r.raise_for_status()
+    try:
+        res = r.json()
+    except ValueError:
+        raise RuntimeError("Sheet script did not return data. Check the web app URL and that "
+                           "access is set to 'Anyone'.")
+    if "error" in res:
+        raise RuntimeError(f"Google Sheet: {res['error']}")
+    return res
+
+
+def to_rows(df: pd.DataFrame) -> list:
+    out = clean(df)
+    out["Week"] = out["Week"].dt.strftime("%Y-%m-%d")
+    out = out.astype(object).where(out.notna(), "")
+    return out.values.tolist()
+
+
+def clean(df: pd.DataFrame) -> pd.DataFrame:
+    df = df.reindex(columns=COLUMNS)
+    df["Week"] = pd.to_datetime(df["Week"], errors="coerce", dayfirst=False)
+    for c in NUM_COLS:
+        df[c] = pd.to_numeric(df[c], errors="coerce")
+    return df
+
+
 def load_db() -> pd.DataFrame:
+    if use_sheets():
+        values = sheet_call("read").get("rows", [])
+        data = values[1:] if values and values[0] == COLUMNS else values
+        return clean(pd.DataFrame(data, columns=COLUMNS) if data else pd.DataFrame(columns=COLUMNS))
     if os.path.exists(DB_PATH):
-        return pd.read_csv(DB_PATH, parse_dates=["Week"])
-    return pd.DataFrame(columns=COLUMNS)
+        return clean(pd.read_csv(DB_PATH))
+    return clean(pd.DataFrame(columns=COLUMNS))
 
 
 def save_db(df: pd.DataFrame):
-    df.to_csv(DB_PATH, index=False)
+    """Replace everything (used after editing the Database tab)."""
+    if use_sheets():
+        sheet_call("replace", [COLUMNS] + to_rows(df))
+    else:
+        clean(df).to_csv(DB_PATH, index=False)
+
+
+def append_db(df: pd.DataFrame):
+    """Add new rows only (used when saving new screenshots)."""
+    if use_sheets():
+        sheet_call("append", to_rows(df))
+    else:
+        save_db(pd.concat([load_db(), clean(df)], ignore_index=True))
 
 
 def summary_pivot(db: pd.DataFrame) -> pd.DataFrame:
@@ -208,6 +276,9 @@ def color_changes(row):
 # ----------------------------------------------------------------------------
 st.set_page_config(page_title="Competitor Price Tracker", layout="wide")
 st.title("🍗 Competitor Price Tracker")
+if not use_sheets():
+    st.warning("⚠ Not connected to Google Sheets. Data is saved temporarily and will be "
+               "lost when the app restarts. Download the Excel after each session.")
 
 with st.sidebar:
     api_key = st.secrets.get("GEMINI_API_KEY", "") if hasattr(st, "secrets") else ""
@@ -278,13 +349,19 @@ with tab_in:
         st.dataframe(result, use_container_width=True)
 
         if st.button("💾 Save to database"):
-            db = pd.concat([load_db(), result[COLUMNS]], ignore_index=True)
-            save_db(db)
+            append_db(result[COLUMNS])
             del st.session_state["draft"]
             st.success(f"Saved {len(result)} row(s).")
             st.rerun()
 
 with tab_db:
+    with st.expander("Import old data (Excel/CSV downloaded from this app or your sheet)"):
+        up = st.file_uploader("File", type=["xlsx", "csv"], key="import")
+        if up is not None and st.button("Add to database"):
+            new = pd.read_csv(up) if up.name.endswith(".csv") else pd.read_excel(up, sheet_name=0)
+            append_db(clean(new))
+            st.success(f"Imported {len(new)} row(s).")
+            st.rerun()
     db = load_db()
     edited_db = st.data_editor(db, num_rows="dynamic", use_container_width=True, key="dbedit")
     if st.button("Save changes & recalculate"):
