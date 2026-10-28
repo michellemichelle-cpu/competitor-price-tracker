@@ -199,8 +199,9 @@ def sheet_call(action: str, rows=None):
     try:
         res = r.json()
     except ValueError:
-        raise RuntimeError("Sheet script did not return data. Check the web app URL and that "
-                           "access is set to 'Anyone'.")
+        hint = "Google returned a sign-in page" if "accounts.google" in r.url or "<html" in r.text[:200].lower() else "Unexpected reply"
+        raise RuntimeError(f"{hint}. The Apps Script web app must be deployed with access "
+                           "'Anyone' (work accounts may block this; use a personal Gmail sheet).")
     if "error" in res:
         raise RuntimeError(f"Google Sheet: {res['error']}")
     return res
@@ -229,6 +230,21 @@ def load_db() -> pd.DataFrame:
     if os.path.exists(DB_PATH):
         return clean(pd.read_csv(DB_PATH))
     return clean(pd.DataFrame(columns=COLUMNS))
+
+
+def safe_load_db() -> pd.DataFrame:
+    """Load without crashing the app; show the real reason on screen."""
+    try:
+        df = load_db()
+        st.session_state["db_ok"] = True
+        return df
+    except Exception as e:
+        st.session_state["db_ok"] = False
+        st.error(f"Could not read the Google Sheet: {e}\n\n"
+                 "Check: (1) Apps Script deployment access = 'Anyone', "
+                 "(2) SHEET_TOKEN matches TOKEN in the script, "
+                 "(3) SHEET_WEBAPP_URL ends with /exec.")
+        return clean(pd.DataFrame(columns=COLUMNS))
 
 
 def save_db(df: pd.DataFrame):
@@ -287,7 +303,7 @@ with st.sidebar:
     today = date.today()
     week = st.date_input("Week", today - timedelta(days=today.weekday()))
     platform = st.selectbox("Platform", ["GrabFood", "GoFood", "ShopeeFood"])
-    db = load_db()
+    db = safe_load_db()
     # dropdown list + any older categories already saved in the database
     categories = CATEGORIES + [c for c in db["Category"].dropna().unique() if c not in CATEGORIES]
     batch_category = st.selectbox(
@@ -349,7 +365,11 @@ with tab_in:
         st.dataframe(result, use_container_width=True)
 
         if st.button("💾 Save to database"):
-            append_db(result[COLUMNS])
+            try:
+                append_db(result[COLUMNS])
+            except Exception as e:
+                st.error(f"Could not save to Google Sheet: {e}")
+                st.stop()
             del st.session_state["draft"]
             st.success(f"Saved {len(result)} row(s).")
             st.rerun()
@@ -362,14 +382,14 @@ with tab_db:
             append_db(clean(new))
             st.success(f"Imported {len(new)} row(s).")
             st.rerun()
-    db = load_db()
+    db = safe_load_db()
     edited_db = st.data_editor(db, num_rows="dynamic", use_container_width=True, key="dbedit")
-    if st.button("Save changes & recalculate"):
+    if st.button("Save changes & recalculate", disabled=not st.session_state.get("db_ok", False)):
         save_db(apply_formulas(edited_db))
         st.rerun()
 
 with tab_sum:
-    pv = summary_pivot(load_db())
+    pv = summary_pivot(safe_load_db())
     if pv.empty:
         st.info("No data yet.")
     else:
@@ -378,6 +398,6 @@ with tab_sum:
                      use_container_width=True)
         buf = io.BytesIO()
         with pd.ExcelWriter(buf, engine="openpyxl") as xw:
-            load_db().to_excel(xw, sheet_name="Raw", index=False)
+            safe_load_db().to_excel(xw, sheet_name="Raw", index=False)
             pv.to_excel(xw, sheet_name="Summary")
         st.download_button("⬇ Download Excel", buf.getvalue(), "competitor_prices.xlsx")
