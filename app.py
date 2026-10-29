@@ -104,31 +104,63 @@ def net_price(x: dict) -> float:
     return round(sub / qty) if sub > 0 else num(x.get("menu_unit_price"))
 
 
+def shrink(data: bytes, mime: str):
+    """Downscale big screenshots so upload to Gemini is fast (text stays readable)."""
+    try:
+        from PIL import Image
+        img = Image.open(io.BytesIO(data))
+        if max(img.size) <= 2000 and len(data) < 1_500_000:
+            return data, mime
+        img = img.convert("RGB")
+        img.thumbnail((2000, 2000))
+        out = io.BytesIO()
+        img.save(out, format="JPEG", quality=85)
+        return out.getvalue(), "image/jpeg"
+    except Exception:
+        return data, mime
+
+
+RETRYABLE = ("503", "429", "500", "504", "UNAVAILABLE", "RESOURCE_EXHAUSTED",
+             "DEADLINE", "timed out", "Timeout", "timeout")
+
+
 @st.cache_data(show_spinner=False)
 def extract(images: tuple, api_key: str) -> dict:
-    """images: tuple of (bytes, media_type). Cached so reruns don't re-call the API."""
-    client = genai.Client(api_key=api_key)
+    """images: tuple of (bytes, media_type). Cached so reruns don't re-call the API.
+    Worst case ~2 minutes, then a clear error instead of spinning forever."""
+    client = genai.Client(api_key=api_key,
+                          http_options=types.HttpOptions(timeout=45_000))  # 45 s per call
     contents = [types.Part.from_bytes(data=b, mime_type=mt) for b, mt in images]
     contents.append(PROMPT)
-    config = types.GenerateContentConfig(
-        response_mime_type="application/json",
-        response_schema=Checkout,
-        temperature=0,
-    )
+    base = dict(response_mime_type="application/json", response_schema=Checkout, temperature=0)
+    use_thinking = True
+    deadline = time.time() + 120
     last_err = None
     for model in MODELS:
-        for attempt in range(3):            # retry each model up to 3x
+        for attempt in range(2):
+            if time.time() > deadline:
+                raise RuntimeError(f"Gemini is too slow right now, try again in a few minutes. "
+                                   f"Last error: {last_err}")
+            cfg = dict(base)
+            if use_thinking:   # reading a receipt needs little reasoning -> much faster
+                cfg["thinking_config"] = types.ThinkingConfig(thinking_level="low")
             try:
                 resp = client.models.generate_content(
-                    model=model, contents=contents, config=config)
+                    model=model, contents=contents, config=types.GenerateContentConfig(**cfg))
+                if not resp.text:
+                    raise RuntimeError("503 empty response")
                 return json.loads(resp.text)
             except Exception as e:
                 last_err = e
                 msg = str(e)
-                if not any(c in msg for c in ("503", "429", "UNAVAILABLE", "RESOURCE_EXHAUSTED", "500")):
-                    raise                    # real error (bad key, bad image) -> stop
-                time.sleep(2 * (attempt + 1))
-    raise RuntimeError(f"All Gemini models busy, try again in a minute. Last error: {last_err}")
+                if use_thinking and "thinking" in msg.lower():
+                    use_thinking = False          # model doesn't support it -> retry without
+                    continue
+                if not any(c in msg for c in RETRYABLE):
+                    raise                          # real error (bad key, bad image) -> stop
+                time.sleep(3)
+    raise RuntimeError(f"All Gemini models are busy, try again in a few minutes. "
+                       f"Last error: {last_err}")
 
 
 # ----------------------------------------------------------------------------
@@ -232,10 +264,19 @@ def load_db() -> pd.DataFrame:
     return clean(pd.DataFrame(columns=COLUMNS))
 
 
+@st.cache_data(ttl=600, show_spinner="Loading data from Google Sheet…")
+def cached_db() -> pd.DataFrame:
+    return load_db()
+
+
+def refresh_db():
+    cached_db.clear()
+
+
 def safe_load_db() -> pd.DataFrame:
     """Load without crashing the app; show the real reason on screen."""
     try:
-        df = load_db()
+        df = cached_db().copy()
         st.session_state["db_ok"] = True
         return df
     except Exception as e:
@@ -253,6 +294,7 @@ def save_db(df: pd.DataFrame):
         sheet_call("replace", [COLUMNS] + to_rows(df))
     else:
         clean(df).to_csv(DB_PATH, index=False)
+    refresh_db()
 
 
 def append_db(df: pd.DataFrame):
@@ -261,6 +303,7 @@ def append_db(df: pd.DataFrame):
         sheet_call("append", to_rows(df))
     else:
         save_db(pd.concat([load_db(), clean(df)], ignore_index=True))
+    refresh_db()
 
 
 def summary_pivot(db: pd.DataFrame) -> pd.DataFrame:
@@ -295,6 +338,7 @@ st.title("🍗 Competitor Price Tracker")
 if not use_sheets():
     st.warning("⚠ Not connected to Google Sheets. Data is saved temporarily and will be "
                "lost when the app restarts. Download the Excel after each session.")
+db_all = safe_load_db()
 
 with st.sidebar:
     api_key = st.secrets.get("GEMINI_API_KEY", "") if hasattr(st, "secrets") else ""
@@ -303,7 +347,7 @@ with st.sidebar:
     today = date.today()
     week = st.date_input("Week", today - timedelta(days=today.weekday()))
     platform = st.selectbox("Platform", ["GrabFood", "GoFood", "ShopeeFood"])
-    db = safe_load_db()
+    db = db_all
     # dropdown list + any older categories already saved in the database
     categories = CATEGORIES + [c for c in db["Category"].dropna().unique() if c not in CATEGORIES]
     batch_category = st.selectbox(
@@ -313,38 +357,63 @@ with st.sidebar:
 tab_in, tab_db, tab_sum = st.tabs(["📤 Upload", "📋 Database", "📊 Summary"])
 
 with tab_in:
-    files = st.file_uploader("Checkout screenshots (PNG/JPG)", type=["png", "jpg", "jpeg", "webp"],
-                             accept_multiple_files=True)
-    one_item = st.checkbox("All uploads belong to ONE menu item (e.g. checkout + voucher detail page)")
+    with st.form("extract_form"):
+        files = st.file_uploader("Checkout screenshots (PNG/JPG)",
+                                 type=["png", "jpg", "jpeg", "webp"], accept_multiple_files=True)
+        one_item = st.checkbox(
+            "All uploads belong to ONE menu item (e.g. checkout + voucher detail page)")
+        submitted = st.form_submit_button("🔍 Extract", type="primary", disabled=not api_key)
 
-    if files and st.button("🔍 Extract", type="primary", disabled=not api_key):
+    if submitted and not files:
+        st.warning("Upload at least one screenshot first.")
+    if submitted and files:
         groups = [files] if one_item else [[f] for f in files]
-        rows, prog = [], st.progress(0.0)
-        for n, group in enumerate(groups):
-            imgs = tuple((f.getvalue(), f.type or "image/png") for f in group)
-            try:
-                x = extract(imgs, api_key)
-            except Exception as e:
-                st.error(f"{group[0].name}: {e}")
-                continue
-            note = x.get("uncertain_fields") or ""
-            rows.append({
-                "Week": pd.Timestamp(week), "Platform": platform,
-                "Ownership": ownership(x.get("store_name"), x.get("brand")),
-                "Category": batch_category, "Brand": x.get("brand", ""),
-                "Menu Name": x.get("menu_name", ""),
-                "Menu Net Price": net_price(x),
-                "Qty for Voucher": max(1, int(num(x.get("quantity_in_cart")) or 1)),
-                "Cart Voucher %": x.get("voucher_percent", 0),
-                "Cart Voucher Min Purchase": x.get("voucher_min_purchase", 0),
-                "Cart Voucher Max Disc": x.get("voucher_max_discount", 0),
-                "Platform Fee": x.get("platform_fee", 0),
-                "Packaging Fee": x.get("packaging_fee", 0),
-                "Notes": f"⚠ check: {note}" if note else "",
-                "_source": ", ".join(f.name for f in group),
-            })
-            prog.progress((n + 1) / len(groups))
-        st.session_state["draft"] = pd.DataFrame(rows)
+        rows, errors = [], []
+        with st.status(f"Reading {len(groups)} screenshot(s)… usually 5–20 s each",
+                       expanded=True) as status:
+            for n, group in enumerate(groups):
+                name = ", ".join(f.name for f in group)
+                st.write(f"⏳ {n + 1}/{len(groups)}: {name}")
+                imgs = tuple(shrink(f.getvalue(), f.type or "image/png") for f in group)
+                t0 = time.time()
+                try:
+                    x = extract(imgs, api_key)
+                except Exception as e:
+                    errors.append(f"{name}: {e}")
+                    st.write(f"❌ failed after {time.time() - t0:.0f} s")
+                    continue
+                st.write(f"✅ done in {time.time() - t0:.0f} s")
+                note = x.get("uncertain_fields") or ""
+                rows.append({
+                    "Week": pd.Timestamp(week), "Platform": platform,
+                    "Ownership": ownership(x.get("store_name"), x.get("brand")),
+                    "Category": batch_category, "Brand": x.get("brand", ""),
+                    "Menu Name": x.get("menu_name", ""),
+                    "Menu Net Price": net_price(x),
+                    "Qty for Voucher": max(1, int(num(x.get("quantity_in_cart")) or 1)),
+                    "Cart Voucher %": x.get("voucher_percent", 0),
+                    "Cart Voucher Min Purchase": x.get("voucher_min_purchase", 0),
+                    "Cart Voucher Max Disc": x.get("voucher_max_discount", 0),
+                    "Platform Fee": x.get("platform_fee", 0),
+                    "Packaging Fee": x.get("packaging_fee", 0),
+                    "Notes": f"⚠ check: {note}" if note else "",
+                    "_source": name,
+                })
+            status.update(label=f"Done: {len(rows)} read, {len(errors)} failed",
+                          state="complete" if rows else "error", expanded=bool(errors))
+        st.session_state["extract_errors"] = errors
+        if rows:
+            # add to anything already waiting for review instead of replacing it
+            old = st.session_state.get("draft")
+            new = pd.DataFrame(rows)
+            st.session_state["draft"] = new if old is None or old.empty else \
+                pd.concat([old, new], ignore_index=True)
+
+    for err in st.session_state.get("extract_errors", []):
+        st.error(err)
+    if st.session_state.get("extract_errors") and st.session_state.get("draft") is None:
+        st.info("Nothing was extracted. Wait a minute and click Extract again "
+                "(already-read screenshots are not re-sent).")
 
     if "draft" in st.session_state and not st.session_state["draft"].empty:
         st.subheader("Review & fill manual columns")
@@ -352,7 +421,7 @@ with tab_in:
         draft = st.session_state["draft"]
         edited = st.data_editor(
             draft,
-            num_rows="dynamic", use_container_width=True, key="editor",
+            num_rows="dynamic", width="stretch", key="editor",
             column_config={
                 "Week": st.column_config.DateColumn(format="D/M/YYYY"),
                 "Ownership": st.column_config.SelectboxColumn(options=["Hangry", "Competitor"]),
@@ -362,7 +431,9 @@ with tab_in:
         )
         result = apply_formulas(edited.reindex(columns=COLUMNS + ["_source"]))
         st.subheader("Result")
-        st.dataframe(result, use_container_width=True)
+        st.dataframe(result, width="stretch", column_config={
+            "Week": st.column_config.DateColumn(format="D/M/YYYY"),
+            "_source": st.column_config.TextColumn("Screenshot")})
 
         if st.button("💾 Save to database"):
             try:
@@ -371,6 +442,7 @@ with tab_in:
                 st.error(f"Could not save to Google Sheet: {e}")
                 st.stop()
             del st.session_state["draft"]
+            st.session_state["extract_errors"] = []
             st.success(f"Saved {len(result)} row(s).")
             st.rerun()
 
@@ -382,22 +454,25 @@ with tab_db:
             append_db(clean(new))
             st.success(f"Imported {len(new)} row(s).")
             st.rerun()
-    db = safe_load_db()
-    edited_db = st.data_editor(db, num_rows="dynamic", use_container_width=True, key="dbedit")
+    if st.button("🔄 Refresh from Google Sheet"):
+        refresh_db()
+        st.rerun()
+    db = db_all
+    edited_db = st.data_editor(db, num_rows="dynamic", width="stretch", key="dbedit")
     if st.button("Save changes & recalculate", disabled=not st.session_state.get("db_ok", False)):
         save_db(apply_formulas(edited_db))
         st.rerun()
 
 with tab_sum:
-    pv = summary_pivot(safe_load_db())
+    pv = summary_pivot(db_all)
     if pv.empty:
         st.info("No data yet.")
     else:
         st.caption("Final Price (After Voucher)/Qty — red = up vs last week, green = down")
         st.dataframe(pv.style.apply(color_changes, axis=1).format("{:,.0f}", na_rep=""),
-                     use_container_width=True)
+                     width="stretch")
         buf = io.BytesIO()
         with pd.ExcelWriter(buf, engine="openpyxl") as xw:
-            safe_load_db().to_excel(xw, sheet_name="Raw", index=False)
+            db_all.to_excel(xw, sheet_name="Raw", index=False)
             pv.to_excel(xw, sheet_name="Summary")
         st.download_button("⬇ Download Excel", buf.getvalue(), "competitor_prices.xlsx")
